@@ -6,6 +6,8 @@ Usage (from inside quantathon-harness/):
   python train.py                      # uses circuits/ and runtime-data.csv
   python train.py --no-cache           # re-parse every circuit
   python train.py --ablate             # also measure each feature group's value
+  python train.py --labels train_labels.csv --test test_labels.csv
+                                       # train on the train split, score on the test split
 
 Outputs:
   features_cache.json   parsed features per circuit (so re-runs are fast)
@@ -105,6 +107,8 @@ def main():
     ap.add_argument("--circuits", default="circuits")
     ap.add_argument("--labels", default="runtime-data.csv")
     ap.add_argument("--rounds", type=int, default=600)
+    ap.add_argument("--test", default=None,
+                    help="labels CSV of held-out circuits to score the final model on")
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--ablate", action="store_true",
                     help="retrain with each feature group removed and report the CV drop")
@@ -182,6 +186,30 @@ def main():
     # ---------- final model on all data ----------
     final = lgb.train(params, lgb.Dataset(X, y), args.rounds)
     final.save_model(MODEL_FILE)
+
+    # ---------- held-out test split (circuits never used in training) ----------
+    if args.test:
+        test = [r for r in load_labels(args.test) if r[0] in feats]
+        overlap = {r[0] for r in test} & set(groups)
+        if overlap:
+            print(f"WARNING: {len(overlap)} test circuits also in training labels!")
+        if test:
+            Xt = np.array([feature_vector(feats[f], t) for f, t, _, _ in test])
+            at = np.array([a for _, _, a, _ in test])
+            tt = np.array([x for _, _, _, x in test])
+            pt = np.clip(10 ** final.predict(Xt), 0.01, CAP_S)
+            st = comp_score(pt, at, tt)
+            print(f"\nTEST SPLIT score ({len({r[0] for r in test})} unseen circuits, "
+                  f"{len(test)} runs): {st.mean():.2%}")
+            with open("test_predictions.csv", "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["filename", "threshold", "actual_s", "timeout", "pred_s", "score"])
+                for (fn, t, a, x), p, sc in zip(test, pt, st):
+                    w.writerow([fn, t, a, int(x), round(float(p), 4), round(float(sc), 4)])
+            print("Test predictions -> test_predictions.csv")
+            print("NOTE: for the final submission, retrain on ALL labels: python train.py")
+        else:
+            print("No test circuits found in circuits/ (check filenames).")
     imp = final.feature_importance("gain")
     order = np.argsort(-imp)
     with open("feature_importance.csv", "w", newline="") as f:
