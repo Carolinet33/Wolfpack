@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 train.py  --  build features, cross-validate, train and save the model.
 
@@ -15,6 +14,7 @@ Outputs:
   cv_predictions.csv    out-of-fold predictions for error analysis / slides
   feature_importance.csv, ablation.csv   inputs for plots.py
 """
+
 import argparse
 import csv
 import json
@@ -104,7 +104,7 @@ def lgb_params(n_rows):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--circuits", default="circuits")
+    ap.add_argument("--circuits", default="training_circuits")
     ap.add_argument("--labels", default="runtime-data.csv")
     ap.add_argument("--rounds", type=int, default=600)
     ap.add_argument("--test", default=None,
