@@ -26,6 +26,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+import numpy as np
+from scipy.optimize import curve_fit
+
 CAP = 14400.0
 OUT = "plots"
 THR_COLORS = {16: "#1f77b4", 64: "#ff7f0e", 512: "#d62728"}
@@ -233,15 +236,37 @@ def ablation_plot():
 
 def learning_curve_plot():
     rows = list(csv.DictReader(open("learning_curve.csv")))
-    x = [int(r["n_train_circuits"]) for r in rows]
-    m = [float(r["cv_mean"]) * 100 for r in rows]
-    e = [float(r["cv_std"]) * 100 for r in rows]
+    x = np.array([int(r["n_train_circuits"]) for r in rows])
+    m = np.array([float(r["cv_mean"]) * 100 for r in rows])
+    e = np.array([float(r["cv_std"]) * 100 for r in rows])
+
+    # --- Fit a logarithmic curve: y = a + b*log(x)
+    def log_curve(x, a, b):
+        return a + b * np.log(x)
+
+    popt, _ = curve_fit(log_curve, x, m, maxfev=10000)
+
+    # --- Extrapolate out to more data
+    x_ext = np.linspace(min(x), 1000, 300)
+    y_ext = log_curve(x_ext, *popt)
+
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.errorbar(x, m, yerr=e, marker="o", capsize=3)
-    ax.set(xlabel="# training circuits", ylabel="CV score (%)",
-           title="Learning curve: still rising = more data would help")
+
+    # Original points
+    ax.errorbar(x, m, yerr=e, marker="o", capsize=3, label="CV score")
+
+    # Fitted curve
+    ax.plot(x_ext, y_ext, color="red", lw=2, label="Logarithmic fit")
+
+    ax.set(
+        xlabel="# training circuits",
+        ylabel="CV score (%)",
+        title="Learning curve with extrapolation"
+    )
     ax.grid(alpha=0.3)
-    save(fig, "13_learning_curve.png")
+    ax.legend()
+
+    save(fig, "13_learning_curve_fit.png")
 
 
 def model_comparison_plot():

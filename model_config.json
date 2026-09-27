@@ -1,1 +1,1 @@
-{"blend_w": 1.0, "use_clf": false, "kind": "lgb"}
+{"blend_w": 1.0, "use_clf": true, "kind": "lgb_2stage"}
