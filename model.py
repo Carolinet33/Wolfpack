@@ -1,5 +1,3 @@
-
-Model · PY
 """
 model.py  --  Quantathon runtime predictor (v3).
  

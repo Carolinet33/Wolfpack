@@ -4,11 +4,15 @@ train.py  --  build features, evaluate with REPEATED grouped CV, train & save.
 
 Typical use (from inside quantathon-harness/):
   python train.py --labels train_labels.csv --test test_labels.csv   # evaluate on the 20% split
+  python train.py --tune --trials 40                                 # Optuna hyperparameter search
   python train.py --compare --ablate --learning-curve               # full analysis on all data
   python train.py --final blend                                     # final model for submission
 
 Flags
   --repeats N        repeated grouped CV: N different random groupings (default 5)
+  --tune             run an Optuna search over LightGBM hyperparameters before everything else
+  --trials N         number of Optuna trials (default 40)
+  --tune-rounds N    boosting rounds used DURING tuning only, kept lower than --rounds for speed (default 300)
   --compare          compare LightGBM / 2-stage / XGBoost-AFT / ridge / random forest / MLP / blend
   --ablate           remove each feature group in turn (paired, same folds) and report the drop
   --learning-curve   score vs fraction of training circuits used
@@ -19,7 +23,7 @@ Flags
 Outputs
   features_cache.json, model_lgb.txt (+ model_ridge.json, model_clf.txt, model_config.json)
   cv_predictions.csv, test_predictions.csv, feature_importance.csv,
-  model_comparison.csv, ablation.csv, learning_curve.csv   (read by plots.py)
+  model_comparison.csv, ablation.csv, learning_curve.csv, model_tuned_params.json   (read by plots.py)
 """
 import argparse
 import csv
@@ -101,11 +105,18 @@ def featurize_all(circuit_dir, cache_path, use_cache):
 
 
 # ----------------------------------------------------------------- models
+# Filled in by tune_lgb() when --tune is passed; merged into every lgb_params()
+# call afterwards so CV, --compare, --ablate, --learning-curve and the final
+# model all train with the same (tuned) hyperparameters.
+_TUNED_OVERRIDES = {}
+
+
 def lgb_params(n_rows, **kw):
     p = dict(objective="l1", learning_rate=0.03, num_leaves=15,
              min_data_in_leaf=max(2, min(15, n_rows // 40)),
              feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
              lambda_l2=1.0, verbose=-1, seed=0)
+    p.update(_TUNED_OVERRIDES)
     p.update(kw)
     return p
 
@@ -187,6 +198,56 @@ def fit_predict(kind, Xtr, ytr, totr, act_tr, Xte, rounds):
     raise ValueError(kind)
 
 
+# ----------------------------------------------------------------- Optuna tuning
+def tune_lgb(X, y, act, to, groups, cols, n_trials, rounds):
+    """Search LightGBM hyperparameters with Optuna.
+
+    Uses a SINGLE grouped 5-fold split per trial (not repeated_cv's repeated
+    version) to keep the search fast -- this is a ranking signal for trials,
+    not the final accuracy estimate. Re-check the winning params afterwards
+    with the normal `--repeats 5` CV, since a single fold split can make a
+    particular hyperparameter combo look better or worse than it really is.
+    """
+    try:
+        import optuna
+    except ImportError:
+        raise SystemExit(
+            "Optuna isn't installed. Run:  pip install optuna\n"
+            "then re-run with --tune."
+        )
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    k = min(5, len(np.unique(groups)))
+
+    def objective(trial):
+        params = lgb_params(
+            len(y),
+            num_leaves=trial.suggest_int("num_leaves", 7, 63),
+            learning_rate=trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+            feature_fraction=trial.suggest_float("feature_fraction", 0.5, 1.0),
+            bagging_fraction=trial.suggest_float("bagging_fraction", 0.5, 1.0),
+            bagging_freq=trial.suggest_int("bagging_freq", 1, 5),
+            lambda_l1=trial.suggest_float("lambda_l1", 1e-3, 10.0, log=True),
+            lambda_l2=trial.suggest_float("lambda_l2", 1e-3, 10.0, log=True),
+            min_data_in_leaf=trial.suggest_int("min_data_in_leaf", 2, 30),
+        )
+        oof = np.full(len(y), np.nan)
+        for tr, te in GroupKFold(n_splits=k).split(X, y, groups):
+            m = lgb.train(params, lgb.Dataset(X[tr][:, cols], y[tr]), rounds)
+            oof[te] = m.predict(X[te][:, cols])
+        return comp_score(to_seconds(oof), act, to).mean()
+
+    study = optuna.create_study(direction="maximize",
+                                sampler=optuna.samplers.TPESampler(seed=0))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+    print(f"\nOptuna: best single-split CV score {study.best_value:.2%} "
+          f"after {n_trials} trials (k={k} folds, {rounds} rounds/trial)")
+    print("Best params:")
+    for name, val in study.best_params.items():
+        print(f"   {name:<16} {val}")
+    return study.best_params
+
+
 # ----------------------------------------------------------------- repeated CV
 def shuffled_groups(groups, seed):
     """GroupKFold is deterministic; relabelling circuits randomly gives a
@@ -230,11 +291,17 @@ def fmt(v):
 # ----------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--circuits", default="circuits")
+    ap.add_argument("--circuits", default="training_circuits")
     ap.add_argument("--labels", default="runtime-data.csv")
     ap.add_argument("--test", default=None)
     ap.add_argument("--rounds", type=int, default=600)
     ap.add_argument("--repeats", type=int, default=5)
+    ap.add_argument("--tune", action="store_true",
+                    help="run an Optuna hyperparameter search before CV/training")
+    ap.add_argument("--trials", type=int, default=40,
+                    help="number of Optuna trials (only used with --tune)")
+    ap.add_argument("--tune-rounds", type=int, default=300,
+                    help="boosting rounds used DURING tuning only (only used with --tune)")
     ap.add_argument("--compare", action="store_true")
     ap.add_argument("--ablate", action="store_true")
     ap.add_argument("--learning-curve", action="store_true")
@@ -248,6 +315,13 @@ def main():
     n_circ = len({r[0] for r in labels})
     print(f"\n{len(labels)} labeled runs over {n_circ} circuits, {len(FEATURE_NAMES)} features")
 
+    if n_circ == 0:
+        raise SystemExit(
+            f"No circuits matched between --circuits {args.circuits!r} and "
+            f"--labels {args.labels!r}. Check that the folder path is correct "
+            f"and that filenames in the labels CSV match the circuit files."
+        )
+
     X = np.array([feature_vector(feats[f], t) for f, t, _, _ in labels])
     act = np.array([a for _, _, a, _ in labels])
     to = np.array([x for _, _, _, x in labels])
@@ -255,6 +329,16 @@ def main():
     groups = np.array([f for f, _, _, _ in labels])
     all_cols = list(range(X.shape[1]))
     can_cv = n_circ >= 5
+
+    if args.tune:
+        if not can_cv:
+            print("Too few circuits to tune (need >=5); skipping --tune.")
+        else:
+            best = tune_lgb(X, y, act, to, groups, all_cols, args.trials, args.tune_rounds)
+            _TUNED_OVERRIDES.update(best)
+            json.dump(best, open("model_tuned_params.json", "w"), indent=2)
+            print("Saved model_tuned_params.json -- these params are now used "
+                  "for CV, --compare, --ablate, --learning-curve and the final model.\n")
 
     if can_cv:
         # ---------- 1. repeated grouped CV of the chosen final model ----------
