@@ -6,12 +6,14 @@ plots.py  --  presentation / analysis figures.  Run AFTER train.py.
 
 Each figure is produced only if its input file exists, so you can run this
 at any stage:
-  runtime-data.csv        -> 01-04  (data exploration, needs labels only)
-  features_cache.json     -> 05-07  (features vs runtime)
-  cv_predictions.csv      -> 08-10  (model accuracy + error analysis, CV / train side)
-  feature_importance.csv  -> 11
-  ablation.csv            -> 12
-  test_predictions.csv    -> 13-15  (model accuracy on the TRUE held-out test split)
+  runtime-data.csv       -> 01-04  (data exploration, needs labels only)
+  features_cache.json    -> 05-07  (features vs runtime)
+  cv_predictions.csv     -> 08-10  (model accuracy + error analysis, CV)
+  test_predictions.csv   -> test_08-10 (same, on the held-out 20% split)
+  feature_importance.csv -> 11
+  ablation.csv           -> 12
+  learning_curve.csv     -> 13
+  model_comparison.csv   -> 14
 """
 import csv
 import json
@@ -149,19 +151,18 @@ def feature_plots(rows, feats):
             "Mid-circuit measurement vs runtime")
 
 
-# ----------------------------------------------------------- shared: pred-vs-actual style plots
-def _load_pred_csv(path):
+# ----------------------------------------------------------- model accuracy
+def cv_plots(path="cv_predictions.csv", prefix="", label="Grouped CV"):
     rows = []
     with open(path, newline="") as f:
         for r in csv.DictReader(f):
             rows.append(dict(f=r["filename"], t=int(r["threshold"]), y=float(r["actual_s"]),
                              to=r["timeout"] == "1", p=float(r["pred_s"]), s=float(r["score"])))
-    return rows
+    if len(rows) < 3:
+        print("  (skip 08-10: too few CV rows)")
+        return
 
-
-def _pred_vs_actual_plots(rows, prefix, label, title_suffix):
-    """Shared plotting logic for both cv_predictions.csv and test_predictions.csv."""
-    # pred vs actual with 2x / 10x bands
+    # 08: predicted vs actual with 2x / 10x bands
     fig, ax = plt.subplots(figsize=(6, 6))
     lo, hi = 0.05, CAP * 2
     g = np.array([lo, hi])
@@ -173,12 +174,12 @@ def _pred_vs_actual_plots(rows, prefix, label, title_suffix):
         ax.scatter([r["y"] for r in sel], [r["p"] for r in sel], s=10, alpha=0.6,
                    color=THR_COLORS[t], label=f"thr {t}")
     ax.set(xscale="log", yscale="log", xlim=(lo, hi), ylim=(lo, hi),
-           xlabel="actual runtime (s)", ylabel=f"predicted (s, {label})",
-           title=f"{title_suffix}: mean score {np.mean([r['s'] for r in rows]):.1%}")
+           xlabel="actual runtime (s)", ylabel="predicted (s, out-of-fold)",
+           title=f"{label}: mean score {np.mean([r['s'] for r in rows]):.1%}")
     ax.legend(fontsize=8, loc="upper left")
-    save(fig, f"{prefix}_pred_vs_actual.png")
+    save(fig, prefix + "08_pred_vs_actual.png")
 
-    # score distribution + per-threshold mean
+    # 09: score distribution + per-threshold mean
     fig, axs = plt.subplots(1, 2, figsize=(10, 4))
     axs[0].hist([r["s"] for r in rows], bins=25, color="#555")
     axs[0].set(xlabel="per-run score", ylabel="# runs", title="Score distribution")
@@ -188,9 +189,9 @@ def _pred_vs_actual_plots(rows, prefix, label, title_suffix):
     for i, m in enumerate(means):
         axs[1].text(i, m + 0.01, f"{m:.1%}", ha="center")
     axs[1].set(ylim=(0, 1), xlabel="threshold", ylabel="mean score", title="Score by threshold")
-    save(fig, f"{prefix}_scores.png")
+    save(fig, prefix + "09_scores.png")
 
-    # worst misses (for error analysis slides) -- also written as CSV
+    # 10: worst misses (for error analysis slides) -- also written as CSV
     worst = sorted(rows, key=lambda r: r["s"])[:15]
     fig, ax = plt.subplots(figsize=(8, 5))
     labels = [f"{r['f'][:8]} @{r['t']}{' (TO)' if r['to'] else ''}" for r in worst]
@@ -199,56 +200,12 @@ def _pred_vs_actual_plots(rows, prefix, label, title_suffix):
     ax.axvline(0, color="k", lw=0.8)
     ax.set(xlabel="log10(pred / actual)   (>0 over-predict, <0 under-predict)",
            title="15 worst predictions")
-    save(fig, f"{prefix}_worst_misses.png")
-    with open(os.path.join(OUT, f"{prefix}_worst_misses.csv"), "w", newline="") as f:
+    save(fig, prefix + "10_worst_misses.png")
+    with open(os.path.join(OUT, prefix + "worst_misses.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["filename", "threshold", "actual_s", "pred_s", "timeout", "score"])
         for r in worst:
             w.writerow([r["f"], r["t"], r["y"], r["p"], int(r["to"]), r["s"]])
-
-
-# ----------------------------------------------------------- model accuracy (train-side CV)
-def cv_plots():
-    if not os.path.exists("cv_predictions.csv"):
-        print("  (skip 08-10: cv_predictions.csv not found)")
-        return
-    rows = _load_pred_csv("cv_predictions.csv")
-    if len(rows) < 3:
-        print("  (skip 08-10: too few CV rows)")
-        return
-    _pred_vs_actual_plots(rows, "08_10", "out-of-fold",
-                          "Grouped CV (train side)")
-    # rename to match original numbering (08, 09, 10) for backwards compatibility
-    for old, new in [("08_10_pred_vs_actual.png", "08_pred_vs_actual.png"),
-                     ("08_10_scores.png", "09_scores.png"),
-                     ("08_10_worst_misses.png", "10_worst_misses.png"),
-                     ("08_10_worst_misses.csv", "worst_misses.csv")]:
-        op, np_ = os.path.join(OUT, old), os.path.join(OUT, new)
-        if os.path.exists(op):
-            os.replace(op, np_)
-
-
-# ------------------------------------------------------ model accuracy (true held-out test)
-def test_plots():
-    """
-    Mirrors cv_plots(), but reads test_predictions.csv -- the circuits from
-    split.py's test_labels.csv that the final model never trained on. This is
-    the closest thing to a real competition score you can get before submitting.
-    Only produced if you ran: python train.py --labels train_labels.csv --test test_labels.csv
-    """
-    rows = _load_pred_csv("test_predictions.csv")
-    if len(rows) < 3:
-        print("  (skip 13-15: too few test rows)")
-        return
-    _pred_vs_actual_plots(rows, "13_15", "held-out test",
-                          "TRUE held-out test split")
-    for old, new in [("13_15_pred_vs_actual.png", "13_pred_vs_actual.png"),
-                     ("13_15_scores.png", "14_scores.png"),
-                     ("13_15_worst_misses.png", "15_worst_misses.png"),
-                     ("13_15_worst_misses.csv", "test_worst_misses.csv")]:
-        op, np_ = os.path.join(OUT, old), os.path.join(OUT, new)
-        if os.path.exists(op):
-            os.replace(op, np_)
 
 
 def importance_plot():
@@ -261,16 +218,45 @@ def importance_plot():
 
 def ablation_plot():
     rows = list(csv.DictReader(open("ablation.csv")))
-    full = float(rows[0]["cv_score"])
-    rest = sorted(rows[1:], key=lambda r: float(r["cv_score"]))
-    fig, ax = plt.subplots(figsize=(7, 4))
-    drops = [(float(r["cv_score"]) - full) * 100 for r in rest]
-    ax.barh([r["removed_group"] for r in rest][::-1], drops[::-1],
-            color=["#d62728" if d < 0 else "#2ca02c" for d in drops[::-1]])
+    full = float(rows[0]["cv_mean"])
+    rest = sorted(rows[1:], key=lambda r: float(r["delta"]))
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    d = [float(r["delta"]) * 100 for r in rest][::-1]
+    e = [float(r["delta_std"]) * 100 for r in rest][::-1]
+    ax.barh([r["removed_group"] for r in rest][::-1], d, xerr=e, capsize=3,
+            color=["#d62728" if v < 0 else "#2ca02c" for v in d])
     ax.axvline(0, color="k", lw=0.8)
-    ax.set(xlabel="change in CV score when group is removed (points)",
-           title=f"Ablation (full model: {full:.1%})")
+    ax.set(xlabel="change in CV score when group is REMOVED (points, ± over repeats)",
+           title=f"Ablation (full model: {full:.1%}); red = group helps")
     save(fig, "12_ablation.png")
+
+
+def learning_curve_plot():
+    rows = list(csv.DictReader(open("learning_curve.csv")))
+    x = [int(r["n_train_circuits"]) for r in rows]
+    m = [float(r["cv_mean"]) * 100 for r in rows]
+    e = [float(r["cv_std"]) * 100 for r in rows]
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.errorbar(x, m, yerr=e, marker="o", capsize=3)
+    ax.set(xlabel="# training circuits", ylabel="CV score (%)",
+           title="Learning curve: still rising = more data would help")
+    ax.grid(alpha=0.3)
+    save(fig, "13_learning_curve.png")
+
+
+def model_comparison_plot():
+    rows = list(csv.DictReader(open("model_comparison.csv")))
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    names = [r["model"] for r in rows][::-1]
+    m = [float(r["cv_mean"]) * 100 for r in rows][::-1]
+    e = [float(r["cv_std"]) * 100 for r in rows][::-1]
+    ax.barh(names, m, xerr=e, capsize=3, color="#555")
+    for i, v in enumerate(m):
+        ax.text(v + 0.3, i, f"{v:.1f}", va="center", fontsize=8)
+    lo = max(0, min(m) - 10)
+    ax.set(xlim=(lo, 100), xlabel="repeated grouped CV score (%)",
+           title="Model comparison (same folds for every model)")
+    save(fig, "14_model_comparison.png")
 
 
 if __name__ == "__main__":
@@ -283,12 +269,16 @@ if __name__ == "__main__":
         print("Feature plots:")
         feature_plots(rows, feats)
     if os.path.exists("cv_predictions.csv"):
-        print("Model plots (CV, train side):")
+        print("Model plots (cross-validation, out-of-fold):")
         cv_plots()
     if os.path.exists("test_predictions.csv"):
-        print("Model plots (true held-out test):")
-        test_plots()
+        print("Model plots (held-out 20% test split):")
+        cv_plots("test_predictions.csv", prefix="test_", label="Test split (unseen circuits)")
     if os.path.exists("feature_importance.csv"):
         importance_plot()
     if os.path.exists("ablation.csv"):
         ablation_plot()
+    if os.path.exists("learning_curve.csv"):
+        learning_curve_plot()
+    if os.path.exists("model_comparison.csv"):
+        model_comparison_plot()

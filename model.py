@@ -22,6 +22,10 @@ Feature families (one pass over the circuit):
   6. Measurement : #measurements, #mid-circuit measurements, #classically
                    controlled gates, #if-blocks
   7. Setting     : log2(threshold) + threshold-interaction features
+  8. Graph       : interaction graph of 2q gates (distinct pairs, degree)
+  9. Sampling    : cost of drawing SHOTS samples at the end (~shots*n*chi^2)
+     Mid-circuit : gates after the first measurement x shots (likely per-shot
+                   re-simulation), time-integrated entanglement over snapshots
 """
 
 import math
@@ -34,8 +38,12 @@ MIN_S = 0.01
 MAX_LC = 64
 PARSE_BUDGET_S = 6.0        # stop detailed parsing after this and extrapolate
 N_SNAPSHOTS = 16            # entropy snapshots through the circuit
+SHOTS = 1024                # fixed in every training run (runtime-data.csv)
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_FILE = os.path.join(HERE, "model_lgb.txt")
+RIDGE_FILE = os.path.join(HERE, "model_ridge.json")   # optional blend partner
+CLF_FILE = os.path.join(HERE, "model_clf.txt")        # optional timeout classifier
+CONFIG_FILE = os.path.join(HERE, "model_config.json")
 PI2 = math.pi / 2
 
 # ----------------------------------------------------------------------------
@@ -261,8 +269,11 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
     hist1 = [0] * (MAX_LC + 1)
     c = dict(n_1q=0, n_2q=0, n_3q=0, n_meas=0, n_cond=0, n_reset=0,
              n_param=0, n_nonclifford=0, n_rank4=0, span_sum=0, span_max=0,
-             n_nn=0, meas_before_last_gate=0)
-    st = {"meas_seen": 0}
+             n_nn=0, meas_before_last_gate=0, reset_before_last_gate=0)
+    st = {"meas_seen": 0, "ops": 0, "first_meas_ops": -1, "snap_ops": 0,
+          "resets_seen": 0}
+    pairs = set()
+    snaps = []                                        # (S_max at snapshot, gates in segment)
     tab = Tableau(nq)
     ent = {"peak_max": 0, "peak_mid": 0, "peak_mean": 0.0, "final_max": 0,
            "n_snap": 0}
@@ -272,6 +283,8 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
         if not prof:
             return
         mx = max(prof)
+        snaps.append((mx, st["ops"] - st["snap_ops"]))
+        st["snap_ops"] = st["ops"]
         ent["n_snap"] += 1
         ent["final_max"] = mx
         if mx >= ent["peak_max"]:
@@ -379,6 +392,8 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
         elif nm in NONCLIFF_FIXED:
             c["n_nonclifford"] += 1
         c["meas_before_last_gate"] = st["meas_seen"]
+        c["reset_before_last_gate"] = st["resets_seen"]
+        st["ops"] += 1
         if k == 1:
             a = qs[0]
             c["n_1q"] += 1
@@ -404,6 +419,11 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
             d = k - 1
             for ctl in qs[:-1]:                      # multi-controlled: CX chain proxy
                 tab.cx(ctl, qs[-1])
+        if k == 2:
+            pairs.add((a, b))
+        else:
+            for i in range(len(qs) - 1):
+                pairs.add((min(qs[i], qs[i + 1]), max(qs[i], qs[i + 1])))
         c["span_sum"] += span
         if span > c["span_max"]:
             c["span_max"] = span
@@ -493,6 +513,8 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
                 snapshot(); last_snap = si; gates_since_snap = 0
             for q in qs:
                 tab.measure(q)
+            if st["first_meas_ops"] < 0:
+                st["first_meas_ops"] = st["ops"]
             c["n_meas"] += max(len(qs), 1)
             st["meas_seen"] += max(len(qs), 1)
             continue
@@ -500,9 +522,15 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
         if first in SKIP_KW or first.startswith("for") or first.startswith("while"):
             continue
         if first == "reset":
-            c["n_reset"] += 1
-            for q in q_of(s[5:]):
+            # reset = measure + conditional flip: non-unitary, disentangles the
+            # qubit, and (like a mid-circuit measurement) likely forces per-shot work
+            rq = q_of(s[5:])
+            for q in rq:
                 tab.measure(q)
+            if st["first_meas_ops"] < 0:
+                st["first_meas_ops"] = st["ops"]
+            c["n_reset"] += max(len(rq), 1)
+            st["resets_seen"] += max(len(rq), 1)
             continue
         if "@" in s:
             s = s.rsplit("@", 1)[1].strip()
@@ -537,13 +565,17 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
     if scale != 1.0:
         for key in ("n_1q", "n_2q", "n_3q", "n_meas", "n_cond", "n_reset",
                     "n_param", "n_nonclifford", "n_rank4", "span_sum", "n_nn",
-                    "meas_before_last_gate"):
+                    "meas_before_last_gate", "reset_before_last_gate"):
             c[key] = int(c[key] * scale)
         hist1 = [h * scale for h in hist1]
         hist2 = [h * scale for h in hist2]
 
     n2 = c["n_2q"] + c["n_3q"]
     depth = max(layer) if layer else 0
+    deg = [0] * nq
+    for a_, b_ in pairs:
+        deg[a_] += 1; deg[b_] += 1
+    after_meas = (st["ops"] - st["first_meas_ops"]) if st["first_meas_ops"] >= 0 else 0
     if occ:
         wm = sum(occ) / len(occ)
         wv = sum((o - wm) ** 2 for o in occ) / len(occ)
@@ -567,6 +599,11 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
         "S_peak_mid": ent["peak_mid"],
         "S_peak_mean": ent["peak_mean"],
         "S_final_max": ent["final_max"],
+        "snaps": [[int(sv), int(g * scale)] for sv, g in snaps],
+        "n_pairs": len(pairs),
+        "deg_mean": sum(deg) / nq,
+        "deg_max": max(deg) if deg else 0,
+        "gates_after_meas": int(after_meas * scale),
         "hist1": hist1,
         "hist2": hist2,
         "parse_s": time.perf_counter() - t0,
@@ -588,8 +625,13 @@ FEATURE_GROUPS = {
                     "log_cross_mean"],
     "bond_tracker": ["lcost2", "lcost1", "frac_sat", "max_lc", "mean_lc"],
     "entropy":     ["S_peak_max", "S_peak_mid", "S_peak_mean", "S_frac",
-                    "S_excess_thr", "S_capped_thr", "lcost_entropy"],
-    "measurement": ["log_meas", "log_meas_mid", "log_cond", "log_if"],
+                    "S_excess_thr", "S_capped_thr", "lcost_entropy",
+                    "S_time_mean", "frac_time_sat", "lcost_entropy_time"],
+    "graph":       ["log_pairs", "pair_density", "deg_mean", "log_deg_max"],
+    "sampling":    ["lcost_sample", "lcost_sample_tracker"],
+    "measurement": ["log_meas", "log_meas_mid", "log_cond", "log_if",
+                    "log_reset", "log_reset_mid",
+                    "log_gates_after_meas", "log_shot_resim"],
     "flags":       ["log_bytes", "failed", "truncated"],
 }
 FEATURE_NAMES = [n for g in FEATURE_GROUPS.values() for n in g]
@@ -616,6 +658,15 @@ def feature_dict(f, thr):
     depth = f.get("depth", 0)
     S = f.get("S_peak_max", 0)
     chi_S = min(2.0 ** min(S, 60), thr)
+    snaps = f.get("snaps", [])
+    gw = sum(g for _, g in snaps)
+    S_time = sum(sv * g for sv, g in snaps) / gw if gw else float(S)
+    t_sat = sum(g for sv, g in snaps if sv >= lthr) / gw if gw else 0.0
+    cost_time = sum(g * min(2.0 ** min(sv, 60), thr) ** 3 for sv, g in snaps)
+    chi_T = min(2.0 ** min(f.get("max_lc", 0), 60), thr)
+    n_used = f.get("n_used", nq)
+    pairs_possible = nq * (nq - 1) / 2.0
+    mid = f.get("meas_before_last_gate", 0) + f.get("reset_before_last_gate", 0)
     return {
         "log2_thr": lthr,
         "log_nq": math.log10(nq), "frac_used": f.get("n_used", nq) / nq,
@@ -639,8 +690,19 @@ def feature_dict(f, thr):
         "S_excess_thr": max(0.0, S - lthr),
         "S_capped_thr": min(S, lthr),
         "lcost_entropy": lg((n2 + n3) * chi_S ** 3),
+        "S_time_mean": S_time, "frac_time_sat": t_sat,
+        "lcost_entropy_time": lg(cost_time),
+        "log_pairs": lg(f.get("n_pairs", 0)),
+        "pair_density": f.get("n_pairs", 0) / pairs_possible if pairs_possible else 0.0,
+        "deg_mean": f.get("deg_mean", 0.0), "log_deg_max": lg(f.get("deg_max", 0)),
+        "lcost_sample": lg(SHOTS * n_used * chi_S ** 2),
+        "lcost_sample_tracker": lg(SHOTS * n_used * chi_T ** 2),
+        "log_gates_after_meas": lg(f.get("gates_after_meas", 0)),
+        "log_shot_resim": lg(SHOTS * f.get("gates_after_meas", 0)) if mid else 0.0,
         "log_meas": lg(f.get("n_meas", 0)), "log_meas_mid": lg(f.get("meas_before_last_gate", 0)),
         "log_cond": lg(f.get("n_cond", 0)), "log_if": lg(f.get("n_if", 0)),
+        "log_reset": lg(f.get("n_reset", 0)),
+        "log_reset_mid": lg(f.get("reset_before_last_gate", 0)),
         "log_bytes": lg(f.get("n_bytes", 0)),
         "failed": float(f.get("failed", 0)), "truncated": float(f.get("truncated", 0)),
     }
@@ -655,14 +717,33 @@ def feature_vector(f, thr):
 # Harness interface
 # ----------------------------------------------------------------------------
 class RuntimeModel:
+    """Loads whatever train.py saved:
+       model_lgb.txt     LightGBM regressor on log10(seconds)       (required)
+       model_ridge.json  ridge regression, blended in with weight    (optional)
+       model_clf.txt     timeout classifier: P(timeout) > 0.5 -> cap (optional)
+       model_config.json blend weight / which parts are active"""
+
     def __init__(self):
-        self.booster = None
-        if os.path.exists(MODEL_FILE):
-            try:
+        import json
+        self.booster = self.clf = self.ridge = None
+        self.cfg = {"blend_w": 1.0, "use_clf": False}
+        try:
+            if os.path.exists(CONFIG_FILE):
+                self.cfg.update(json.load(open(CONFIG_FILE)))
+            if os.path.exists(MODEL_FILE):
                 import lightgbm as lgb
                 self.booster = lgb.Booster(model_file=MODEL_FILE)
-            except Exception as e:
-                print(f"[model] could not load {MODEL_FILE}: {e}")
+                if self.cfg.get("use_clf") and os.path.exists(CLF_FILE):
+                    self.clf = lgb.Booster(model_file=CLF_FILE)
+            if self.cfg.get("blend_w", 1.0) < 1.0 and os.path.exists(RIDGE_FILE):
+                self.ridge = json.load(open(RIDGE_FILE))
+        except Exception as e:
+            print(f"[model] could not load trained model: {e}")
+
+    def _ridge(self, x):
+        r = self.ridge
+        z = [(xi - m) / s for xi, m, s in zip(x, r["mean"], r["scale"])]
+        return r["intercept"] + sum(zi * ci for zi, ci in zip(z, r["coef"]))
 
     def featurize(self, qasm_text):
         try:
@@ -676,6 +757,11 @@ class RuntimeModel:
             x = feature_vector(features, threshold)
             if self.booster is not None:
                 log_s = float(self.booster.predict([x])[0])
+                if self.ridge is not None:
+                    w = self.cfg["blend_w"]
+                    log_s = w * log_s + (1 - w) * self._ridge(x)
+                if self.clf is not None and float(self.clf.predict([x])[0]) > 0.5:
+                    return CAP_S
             else:
                 log_s = -0.8 + 0.25 * x[FEATURE_NAMES.index("lcost2")]
         except Exception:
