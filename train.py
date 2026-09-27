@@ -36,7 +36,9 @@ from run import read_qasm
 import model as M
 from model import parse_qasm, feature_vector, FEATURE_NAMES, FEATURE_GROUPS, CAP_S
 
-CACHE_VERSION = "v3-graph-sampling"
+# FIX: bumped from "v3-graph-sampling" so the old cached features (made by
+# the buggy parser) are thrown away and every circuit is re-parsed.
+CACHE_VERSION = "v4-parser-fixes"
 LOG_CAP = np.log10(CAP_S)
 
 
@@ -228,7 +230,7 @@ def fmt(v):
 # ----------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--circuits", default="training_circuits")
+    ap.add_argument("--circuits", default="circuits")
     ap.add_argument("--labels", default="runtime-data.csv")
     ap.add_argument("--test", default=None)
     ap.add_argument("--rounds", type=int, default=600)

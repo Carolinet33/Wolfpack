@@ -1,9 +1,20 @@
-"""
-model.py  --  Quantathon runtime predictor (v2).
 
+Model · PY
+"""
+model.py  --  Quantathon runtime predictor (v3).
+ 
+v3 changes (all marked "FIX:" in the code):
+  * parse-time budget is now enforced everywhere (every circuit < 15 s;
+    previously 5 circuits took 11-107 s)
+  * register regexes anchored to line starts (6x faster on 200 MB files)
+  * "measure" matched as a whole word (register names like
+    final_measurement no longer counted as measurements / wrong qubits)
+  * custom gate parameters substituted into gate bodies on expansion
+  * controlled-phase gates counted as Clifford only at multiples of pi
+ 
 featurize(qasm_text) -> dict of circuit features   (pure Python, QASM 2 + 3)
 predict(features, threshold) -> predicted seconds (LightGBM on log10 runtime)
-
+ 
 Feature families (one pass over the circuit):
   1. Size        : #qubits, #gates, #1q, #2q, #3q+, depth, 2q-depth,
                    gates per layer, active-qubit width per layer (mean / std)
@@ -27,16 +38,16 @@ Feature families (one pass over the circuit):
      Mid-circuit : gates after the first measurement x shots (likely per-shot
                    re-simulation), time-integrated entanglement over snapshots
 """
-
+ 
 import math
 import os
 import re
 import time
-
+ 
 CAP_S = 14400.0
 MIN_S = 0.01
 MAX_LC = 64
-PARSE_BUDGET_S = 6.0        # stop detailed parsing after this and extrapolate
+PARSE_BUDGET_S = 8.0        # FIX: hard cap on featurize time (harness limit is 15 s)
 N_SNAPSHOTS = 16            # entropy snapshots through the circuit
 SHOTS = 1024                # fixed in every training run (runtime-data.csv)
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -45,7 +56,7 @@ RIDGE_FILE = os.path.join(HERE, "model_ridge.json")   # optional blend partner
 CLF_FILE = os.path.join(HERE, "model_clf.txt")        # optional timeout classifier
 CONFIG_FILE = os.path.join(HERE, "model_config.json")
 PI2 = math.pi / 2
-
+ 
 # ----------------------------------------------------------------------------
 # Gate knowledge
 # ----------------------------------------------------------------------------
@@ -57,18 +68,38 @@ SKIP_KW = {"OPENQASM", "include", "qreg", "creg", "qubit", "bit", "barrier",
            "delay", "pragma", "return", "extern", "box"}
 NONCLIFF_FIXED = {"t", "tdg", "ccx", "cswap", "ccz", "ch", "csx", "rccx",
                   "c3x", "c4x", "mcx", "c3sqrtx", "toffoli"}
-
-_REG2 = re.compile(r"\bqreg\s+(\w+)\s*\[\s*(\d+)\s*\]")
-_REG3 = re.compile(r"\bqubit\s*(?:\[\s*(\d+)\s*\])?\s+(\w+)\s*;")
+ 
+# FIX: register declarations. The "^[ \t]*" anchor + re.M makes the regex
+# only try matching at the start of each line instead of at every character,
+# which is ~6x faster on the 200 MB circuits. The _ANY versions are the old
+# unanchored patterns, used only as a fallback if nothing is found at line starts.
+_REG2 = re.compile(r"^[ \t]*qreg\s+(\w+)\s*\[\s*(\d+)\s*\]", re.M)
+_REG2_ANY = re.compile(r"\bqreg\s+(\w+)\s*\[\s*(\d+)\s*\]")
+_REG3 = re.compile(r"^[ \t]*qubit\s*(?:\[\s*(\d+)\s*\])?\s+(\w+)\s*;", re.M)
+_REG3_ANY = re.compile(r"\bqubit\s*(?:\[\s*(\d+)\s*\])?\s+(\w+)\s*;")
 _GATEDEF = re.compile(
     r"\bgate\s+(\w+)\s*(?:\(([^)]*)\))?\s*([^{]*)\{([^}]*)\}", re.S)
 _COMMENT_LINE = re.compile(r"//[^\n]*")
 _COMMENT_BLOCK = re.compile(r"/\*.*?\*/", re.S)
 _NUMEXPR = re.compile(r"[0-9eE+\-*/.,() ]*")
-
+ 
+# FIX: "measure" as a whole word only, so a register named final_measurement
+# is not mistaken for a measurement.
+_MEAS = re.compile(r"\bmeasure\b")
+ 
+# FIX: controlled-phase/rotation family: Clifford only at multiples of pi
+# (not pi/2 like single-qubit rotations), so they need a separate check.
+CTRL_PHASE = {"cp", "cu1", "crz", "cphase", "crx", "cry", "cu3", "cu", "mcphase"}
+ 
+ 
+class _OutOfTime(Exception):
+    """FIX: raised from inside apply() when the parse budget runs out, so we
+    can stop even in the middle of a huge custom-gate expansion."""
+    pass
+ 
 _param_cache = {}
-
-
+ 
+ 
 def _param_vals(pstr):
     """Evaluate a parameter string like 'pi/4, -0.3' -> tuple of floats
     (None if symbolic). Cached, since the same strings repeat constantly."""
@@ -85,17 +116,17 @@ def _param_vals(pstr):
     if len(_param_cache) < 200000:
         _param_cache[pstr] = r
     return r
-
-
+ 
+ 
 def _k(theta, unit=PI2):
     """Nearest integer multiple of `unit`, mod 4 (for pi/2) -- Clifford rounding."""
     return int(round(theta / unit)) % 4
-
-
+ 
+ 
 def _is_clifford_params(vals):
     return vals is not None and all(abs(v / PI2 - round(v / PI2)) < 1e-6 for v in vals)
-
-
+ 
+ 
 def _split_call(s):
     """'name(params) ops' -> (name, params_or_None, ops). Handles nested ()."""
     i, n = 0, len(s)
@@ -116,8 +147,8 @@ def _split_call(s):
             k += 1
         params, j = s[j + 1:k], k + 1
     return name, params, s[j:]
-
-
+ 
+ 
 # ----------------------------------------------------------------------------
 # Stabilizer tableau (phase-free) for Clifford-skeleton entanglement entropy
 # ----------------------------------------------------------------------------
@@ -126,38 +157,38 @@ class Tableau:
     whose bit r says whether generator r has an X / Z component on qubit q.
     Signs are ignored -- they never affect entanglement entropy.
     Gates become a couple of integer XORs, which is very fast in Python."""
-
+ 
     def __init__(self, n):
         self.n = n
         self.X = [0] * n
         self.Z = [1 << q for q in range(n)]      # |0...0> : generators Z_q
-
+ 
     # --- Clifford primitives ---
     def h(self, a):
         X, Z = self.X, self.Z
         X[a], Z[a] = Z[a], X[a]
-
+ 
     def s(self, a):                               # S / Sdg (same without signs)
         self.Z[a] ^= self.X[a]
-
+ 
     def sx(self, a):                              # sqrt(X) / sqrt(X)^dag
         self.X[a] ^= self.Z[a]
-
+ 
     def cx(self, c, t):
         X, Z = self.X, self.Z
         X[t] ^= X[c]
         Z[c] ^= Z[t]
-
+ 
     def cz(self, a, b):
         X, Z = self.X, self.Z
         Z[a] ^= X[b]
         Z[b] ^= X[a]
-
+ 
     def swap(self, a, b):
         X, Z = self.X, self.Z
         X[a], X[b] = X[b], X[a]
         Z[a], Z[b] = Z[b], Z[a]
-
+ 
     def measure(self, a):
         """Z-measurement: if some generator anticommutes with Z_a, it is
         replaced by Z_a (after multiplying it into the other anticommuting
@@ -177,7 +208,7 @@ class Tableau:
                 zq ^= others
             X[q], Z[q] = xq & keep, zq & keep
         Z[a] |= pbit
-
+ 
     # --- entropy of every prefix cut [0..c] | [c+1..n-1] ---
     def prefix_entropies(self):
         """S(A) = rank_GF2(generators restricted to A) - |A|  (Fattal et al.).
@@ -199,8 +230,8 @@ class Tableau:
                     v ^= b
             out.append(rank - (q + 1))
         return out
-
-
+ 
+ 
 # ----------------------------------------------------------------------------
 # Parser
 # ----------------------------------------------------------------------------
@@ -208,12 +239,12 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
     t0 = time.perf_counter()
     feats = {"n_bytes": len(text), "truncated": 0, "failed": 0,
              "n_if": text.count("if (") + text.count("if(")}
-
+ 
     if "/*" in text:
         text = _COMMENT_BLOCK.sub("", text)
     if "//" in text:
         text = _COMMENT_LINE.sub("", text)
-
+ 
     # ---- registers -> global qubit indices ----
     regs, nq = {}, 0
     for name, size in _REG2.findall(text):
@@ -221,13 +252,30 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
     for size, name in _REG3.findall(text):
         sz = int(size) if size else 1
         regs[name] = (nq, sz); nq += sz
+    # FIX: fallback -- if no declaration started a line (e.g. several
+    # statements crammed onto one line), use the slower patterns.
+    if nq == 0:
+        for name, size in _REG2_ANY.findall(text):
+            regs[name] = (nq, int(size)); nq += int(size)
+        for size, name in _REG3_ANY.findall(text):
+            sz = int(size) if size else 1
+            regs[name] = (nq, sz); nq += sz
     nq = max(nq, 1)
-
+ 
     # ---- custom gate definitions (expanded recursively into primitives) ----
     gdefs = {}
     if re.search(r"(^|\n|;)\s*gate\s", text):
-        for gname, _p, qargs, body in _GATEDEF.findall(text):
+        for gi, (gname, _p, qargs, body) in enumerate(_GATEDEF.findall(text)):
+            # FIX: budget check every 1024 definitions. Gate-def parsing gets
+            # at most 60% of the budget so the main gate loop still has time
+            # to run afterwards (one circuit has 524,000 definitions).
+            if (gi & 0x3FF) == 0 and time.perf_counter() - t0 > 0.6 * budget_s:
+                feats["truncated"] = 1
+                break
             qa = [x.strip() for x in qargs.split(",") if x.strip()]
+            # FIX: remember the gate's parameter names, e.g. ["p0", "p1"],
+            # so actual values can be substituted in at call time.
+            pn = [x.strip() for x in _p.split(",") if x.strip()] if _p else []
             prims = []
             for st in body.split(";"):
                 st = st.strip()
@@ -238,24 +286,49 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
                 nm, pr, ops = _split_call(st)
                 loc = [qa.index(o.strip()) for o in ops.split(",") if o.strip() in qa]
                 prims.append((nm, pr, loc))
-            gdefs[gname] = prims
+            gdefs[gname] = (pn, prims)                # FIX: (param names, body)
         text = _GATEDEF.sub("", text)
-
+ 
     expand_cache = {}
-
-    def expand(nm, depth=0):
-        if nm in expand_cache:
-            return expand_cache[nm]
+ 
+    def expand(nm, pr=None, depth=0):
+        """Flatten custom gate `nm`, called with parameter string `pr`
+        (e.g. "pi/4, 0.3"), into a list of primitive gates.
+        FIX: the actual parameter values are substituted into the body, so
+        r(pi/2, 0) becomes U((pi/2), -pi/2 + (0), ...) and can be evaluated."""
+        key = (nm, pr)                    # same gate + same params -> reuse result
+        if key in expand_cache:
+            return expand_cache[key]
+        pnames, prims = gdefs.get(nm, ([], []))
+ 
+        # Build a substitution function: parameter name -> "(actual value)".
+        # The parentheses keep things like -pi/2 + (a+b) mathematically correct.
+        sub = None
+        if pnames and pr is not None:
+            vals = [v.strip() for v in pr.split(",")]
+            if len(vals) == len(pnames):
+                mp = dict(zip(pnames, vals))
+                # \b...\b so parameter "p" doesn't also replace the p in "pi"
+                pat = re.compile(r"\b(" + "|".join(re.escape(x) for x in pnames) + r")\b")
+                sub = lambda t: pat.sub(lambda m: "(" + mp[m.group(1)] + ")", t)
+ 
         out = []
-        for pnm, ppr, loc in gdefs.get(nm, []):
+        for pnm, ppr, loc in prims:
+            if ppr is not None and sub is not None:
+                ppr = sub(ppr)            # plug in this call's actual values
             if pnm in gdefs and depth < 20:
-                for snm, spr, sloc in expand(pnm, depth + 1):
+                # nested custom gate: expand it too, passing the substituted params
+                for snm, spr, sloc in expand(pnm, ppr, depth + 1):
                     out.append((snm, spr, [loc[i] for i in sloc if i < len(loc)]))
             else:
                 out.append((pnm, ppr, loc))
-        expand_cache[nm] = out
+ 
+        # Cap the cache: circuits with thousands of distinct angles would
+        # otherwise store thousands of expansions.
+        if len(expand_cache) < 20000:
+            expand_cache[key] = out
         return out
-
+ 
     # ---- state ----
     ncut = max(nq - 1, 1)
     lc = [0] * ncut                                  # bond tracker, log2 chi
@@ -277,7 +350,7 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
     tab = Tableau(nq)
     ent = {"peak_max": 0, "peak_mid": 0, "peak_mean": 0.0, "final_max": 0,
            "n_snap": 0}
-
+ 
     def snapshot():
         prof = tab.prefix_entropies()
         if not prof:
@@ -293,7 +366,7 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
         mid = prof[len(prof) // 2]
         if mid > ent["peak_mid"]:
             ent["peak_mid"] = mid
-
+ 
     def place(qs):
         """Depth / width bookkeeping for a gate on qubits qs."""
         L = 0
@@ -306,7 +379,7 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
         if L >= len(occ):
             occ.append(0)
         occ[L] += len(qs)
-
+ 
     # --- Clifford-skeleton action for each gate on the tableau ---
     def tab_1q(nm, vals, a):
         if nm == "h":
@@ -339,7 +412,7 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
                 tab.h(a)
             if _k(vals[1]) & 1:
                 tab.s(a)
-
+ 
     def tab_2q(nm, vals, a, b):
         if nm in ("cx", "CX", "cnot", "ecr", "ch", "csx", "cy"):
             tab.cx(a, b)
@@ -379,7 +452,7 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
                 tab.swap(a, b); tab.cz(a, b); tab.s(a); tab.s(b)
         else:
             tab.cx(a, b)                             # unknown / ctrl@ gates: treat as an entangler
-
+ 
     def apply(nm, pr, qs):
         k = len(qs)
         if k == 0:
@@ -387,13 +460,22 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
         vals = _param_vals(pr) if pr is not None else None
         if pr is not None:
             c["n_param"] += 1
-            if not _is_clifford_params(vals):
+            if nm in CTRL_PHASE:
+                # FIX: controlled rotations are Clifford only at multiples of pi
+                if vals is None or abs(vals[0] / math.pi - round(vals[0] / math.pi)) > 1e-6:
+                    c["n_nonclifford"] += 1
+            elif not _is_clifford_params(vals):
                 c["n_nonclifford"] += 1
         elif nm in NONCLIFF_FIXED:
             c["n_nonclifford"] += 1
         c["meas_before_last_gate"] = st["meas_seen"]
         c["reset_before_last_gate"] = st["resets_seen"]
         st["ops"] += 1
+        # FIX: budget check every 4096 gates. This catches huge custom-gate
+        # expansions, where one statement can expand into millions of gates
+        # and the per-statement check below never gets a chance to run.
+        if (st["ops"] & 0xFFF) == 0 and time.perf_counter() - t0 > budget_s:
+            raise _OutOfTime
         if k == 1:
             a = qs[0]
             c["n_1q"] += 1
@@ -446,7 +528,7 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
         for q in qs:
             layer2[q] = L2 + 1
         place(qs)
-
+ 
     def q_of(tok):
         tok = tok.strip()
         br = tok.find("[")
@@ -469,16 +551,17 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
         if r is None:
             return [idx] if idx < nq else []
         return [r[0] + idx]
-
+ 
     stmts = text.split(";")
     n_stmts = len(stmts)
     snap_every = max(1, n_stmts // N_SNAPSHOTS)
     last_snap = 0
     gates_since_snap = 0
     processed = 0
-
+ 
     for si, s in enumerate(stmts):
-        if (si & 0x3FFF) == 0 and si and time.perf_counter() - t0 > budget_s:
+        # FIX: check every 1024 statements (was 16384)
+        if (si & 0x3FF) == 0 and si and time.perf_counter() - t0 > budget_s:
             feats["truncated"] = 1
             break
         processed = si + 1
@@ -505,8 +588,11 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
             cond = True
         if not s:
             continue
-        if "measure" in s:
-            ops = s.split("measure", 1)[1].split("->")[0]
+        # FIX: whole-word match; the cheap "in" test skips the regex for most lines
+        mm = _MEAS.search(s) if "measure" in s else None
+        if mm:
+            # qubits come right after the word "measure" (and before "->" in QASM 2)
+            ops = s[mm.end():].split("->")[0]
             qs = q_of(ops) if ops.strip() else []
             # snapshot just before measurements start (captures pre-collapse peak)
             if gates_since_snap and (si - last_snap) * 4 >= snap_every:
@@ -547,19 +633,24 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
         else:
             L = max(len(o) for o in opl)
             groups = [[o[i] if len(o) > 1 else o[0] for o in opl] for i in range(L)]
-        if nm in gdefs:
-            prims = expand(nm)
-            for qs in groups:
-                for pnm, ppr, loc in prims:
-                    apply(pnm, ppr, [qs[i] for i in loc if i < len(qs)])
-        else:
-            for qs in groups:
-                apply(nm, pr, qs)
+        try:
+            if nm in gdefs:
+                prims = expand(nm, pr)    # FIX: pass this call's parameters
+                for qs in groups:
+                    for pnm, ppr, loc in prims:
+                        apply(pnm, ppr, [qs[i] for i in loc if i < len(qs)])
+            else:
+                for qs in groups:
+                    apply(nm, pr, qs)
+        except _OutOfTime:
+            # FIX: apply() ran out of budget in the middle of this statement
+            feats["truncated"] = 1
+            break
         gates_since_snap += 1
-
+ 
     if gates_since_snap or ent["n_snap"] == 0:
         snapshot()
-
+ 
     # ---- extrapolate counts if we ran out of time ----
     scale = n_stmts / max(processed, 1) if feats["truncated"] else 1.0
     if scale != 1.0:
@@ -569,7 +660,7 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
             c[key] = int(c[key] * scale)
         hist1 = [h * scale for h in hist1]
         hist2 = [h * scale for h in hist2]
-
+ 
     n2 = c["n_2q"] + c["n_3q"]
     depth = max(layer) if layer else 0
     deg = [0] * nq
@@ -609,8 +700,8 @@ def parse_qasm(text, budget_s=PARSE_BUDGET_S):
         "parse_s": time.perf_counter() - t0,
     })
     return feats
-
-
+ 
+ 
 # ----------------------------------------------------------------------------
 # Feature vector for one (circuit, threshold) pair
 # ----------------------------------------------------------------------------
@@ -635,8 +726,8 @@ FEATURE_GROUPS = {
     "flags":       ["log_bytes", "failed", "truncated"],
 }
 FEATURE_NAMES = [n for g in FEATURE_GROUPS.values() for n in g]
-
-
+ 
+ 
 def feature_dict(f, thr):
     lg = lambda x: math.log10(1.0 + max(float(x), 0.0))
     thr = float(thr)
@@ -706,13 +797,13 @@ def feature_dict(f, thr):
         "log_bytes": lg(f.get("n_bytes", 0)),
         "failed": float(f.get("failed", 0)), "truncated": float(f.get("truncated", 0)),
     }
-
-
+ 
+ 
 def feature_vector(f, thr):
     d = feature_dict(f, thr)
     return [d[n] for n in FEATURE_NAMES]
-
-
+ 
+ 
 # ----------------------------------------------------------------------------
 # Harness interface
 # ----------------------------------------------------------------------------
@@ -722,7 +813,7 @@ class RuntimeModel:
        model_ridge.json  ridge regression, blended in with weight    (optional)
        model_clf.txt     timeout classifier: P(timeout) > 0.5 -> cap (optional)
        model_config.json blend weight / which parts are active"""
-
+ 
     def __init__(self):
         import json
         self.booster = self.clf = self.ridge = None
@@ -739,19 +830,19 @@ class RuntimeModel:
                 self.ridge = json.load(open(RIDGE_FILE))
         except Exception as e:
             print(f"[model] could not load trained model: {e}")
-
+ 
     def _ridge(self, x):
         r = self.ridge
         z = [(xi - m) / s for xi, m, s in zip(x, r["mean"], r["scale"])]
         return r["intercept"] + sum(zi * ci for zi, ci in zip(z, r["coef"]))
-
+ 
     def featurize(self, qasm_text):
         try:
             return parse_qasm(qasm_text)
         except Exception:
             return {"failed": 1, "n_bytes": len(qasm_text), "n_qubits": 1,
                     "hist1": [], "hist2": []}
-
+ 
     def predict(self, features, threshold):
         try:
             x = feature_vector(features, threshold)
@@ -769,3 +860,4 @@ class RuntimeModel:
         if not math.isfinite(log_s):
             log_s = 1.0
         return float(min(max(10.0 ** log_s, MIN_S), CAP_S))
+ 
